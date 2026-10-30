@@ -9,9 +9,9 @@ rsray is a fast Rust CLI that extracts API endpoints hidden inside JavaScript bu
 ## Install
 
 ```bash
-cargo install --path .
-# or, from crates.io once published:
 cargo install rsray
+# or, from a local checkout:
+cargo install --path .
 ```
 
 ## Help
