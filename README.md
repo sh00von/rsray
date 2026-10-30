@@ -14,6 +14,25 @@ cargo install --path .
 cargo install rsray
 ```
 
+## Help
+
+```bash
+rsray --help   # full help with examples
+rsray -h       # short help
+rsray --version
+```
+
+Like sqlmap, progress and timing go to stderr, so stdout stays clean for piping:
+
+```
+[+0.00s] rsray started
+[+0.01s] loading tests/fixtures/sample.js
+[+0.01s] scanning tests/fixtures/sample.js (536 bytes)
+[+0.01s] done: 8 endpoints from 1 source(s) in 0.01s
+```
+
+The final summary also prints `Finished in X.XXs`.
+
 ## Usage
 
 ```bash

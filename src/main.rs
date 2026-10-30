@@ -20,10 +20,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
-#[command(name = "rsray", version, about = "X-ray into JavaScript bundles. Find the hidden API surface.")]
+#[command(name = "rsray", version, about = "X-ray into JavaScript bundles. Find the hidden API surface.", long_about = "rsray — X-ray into JavaScript bundles. Find the hidden API surface.\n\nEXAMPLES:\n  rsray app.js\n  rsray https://example.com/app.js --json -o endpoints.json\n  rsray https://example.com --wordlist words.txt\n  cat js_urls.txt | rsray --stdin\n\nOnly run rsray on sites you own or targets you are authorised to test.\nProgress and timing go to stderr, so stdout stays clean for piping.")]
+
+
 struct Args {
     /// Input: a JS file, a directory, a JS URL, or a website URL.
     /// Use "-" or --stdin to read a list of inputs from stdin.
@@ -177,8 +179,16 @@ fn collect_from_dir(dir: &Path, out: &mut Vec<Source>) {
     }
 }
 
+/// Log a sqlmap-style progress line to stderr: elapsed time + message.
+/// Stderr only, so stdout stays clean for piping into other tools.
+fn progress(start: &Instant, quiet: bool, msg: &str) {
+    if !quiet {
+        eprintln!("[+{:.2}s] {}", start.elapsed().as_secs_f64(), msg);
+    }
+}
+
 /// Gather all JS sources for one input string.
-fn gather(input: &str, depth: usize) -> Vec<Source> {
+fn gather(input: &str, depth: usize, start: &Instant, quiet: bool) -> Vec<Source> {
     let path = Path::new(input);
     if path.is_file() {
         if let Ok(content) = fs::read_to_string(path) {
@@ -198,6 +208,7 @@ fn gather(input: &str, depth: usize) -> Vec<Source> {
             None => return vec![],
         };
         if input.ends_with(".js") {
+            progress(start, quiet, &format!("fetched {} ({} bytes)", input, body.len()));
             let mut sources = vec![Source { name: input.to_string(), content: body.clone() }];
             // Try the source map next to the bundle.
             let map_url = format!("{}.map", input);
@@ -221,6 +232,7 @@ fn gather(input: &str, depth: usize) -> Vec<Source> {
                     continue;
                 }
                 if let Some(js) = fetch_url(&cl, &url) {
+                    progress(start, quiet, &format!("fetched {} ({} bytes)", url, js.len()));
                     if current_depth < depth {
                         for chunk in chunk_refs(&js, &url) {
                             if !seen.contains(&chunk) {
@@ -294,6 +306,8 @@ struct JsonEndpoint<'a> {
 
 fn main() {
     let args = Args::parse();
+    let start = Instant::now();
+    progress(&start, args.quiet, "rsray started");
 
     let mut inputs: Vec<String> = Vec::new();
     if args.stdin || args.input.as_deref() == Some("-") {
@@ -335,9 +349,11 @@ fn main() {
     let mut snippet_map: HashMap<String, String> = HashMap::new();
 
     for input in &inputs {
-        let sources = gather(&input, args.depth);
+        progress(&start, args.quiet, &format!("loading {}", input));
+        let sources = gather(&input, args.depth, &start, args.quiet);
         files_scanned += sources.len();
         for source in sources {
+            progress(&start, args.quiet, &format!("scanning {} ({} bytes)", source.name, source.content.len()));
             let raws: Vec<RawEndpoint> = if source.name.ends_with(".map") {
                 extractor::extract_from_sourcemap(&source.content)
             } else {
@@ -408,7 +424,7 @@ fn main() {
         if !args.quiet {
             let api = all.iter().filter(|e| e.class == Class::Api).count();
             let interesting = all.iter().filter(|e| !e.flags.is_empty()).count();
-            out_text.push_str(&format!("\nScanned {} source(s). Found {} endpoints ({} API, {} flagged interesting).\n", files_scanned, all.len(), api, interesting));
+            out_text.push_str(&format!("\nScanned {} source(s). Found {} endpoints ({} API, {} flagged interesting).\nFinished in {:.2}s.\n", files_scanned, all.len(), api, interesting, start.elapsed().as_secs_f64()));
         }
     }
 
@@ -432,6 +448,8 @@ fn main() {
         }
         None => print!("{}", out_text),
     }
+
+    progress(&start, args.quiet, &format!("done: {} endpoints from {} source(s) in {:.2}s", all.len(), files_scanned, start.elapsed().as_secs_f64()));
 
     if let Some(wordlist_path) = &args.wordlist {
         let words = wordlist_from(&all);

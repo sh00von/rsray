@@ -1,6 +1,6 @@
 [package]
 name = "rsray"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "X-ray into JavaScript bundles. Find the hidden API surface."
 license = "MIT"
