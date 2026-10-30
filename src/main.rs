@@ -247,10 +247,16 @@ fn gather(input: &str, depth: usize, start: &Instant, quiet: bool) -> Vec<Source
             current_depth += 1;
         }
         // Also extract from inline scripts in the page itself.
-        let inline_re = Regex::new(r"(?is)<script(?![^>]+src=)[^>]*>(.*?)</script>").unwrap();
+        let inline_re = Regex::new(r"(?is)<script([^>]*)>(.*?)</script>").unwrap();
         for cap in inline_re.captures_iter(&body) {
-            if let Some(m) = cap.get(1) {
-                sources.push(Source { name: format!("{} (inline)", input), content: m.as_str().to_string() });
+            let attrs = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            if !attrs.to_ascii_lowercase().contains("src=") {
+                if let Some(m) = cap.get(2) {
+                    let script = m.as_str().trim();
+                    if !script.is_empty() {
+                        sources.push(Source { name: format!("{} (inline)", input), content: script.to_string() });
+                    }
+                }
             }
         }
         return sources;
