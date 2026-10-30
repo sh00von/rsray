@@ -626,13 +626,28 @@ fn secret_hits(content: &str) -> Vec<String> {
         (r#"(?i)(secret|token)\s*[:=]\s*["'][A-Za-z0-9_\-\.]{20,}["']"#, "token/secret"),
         (r#"AKIA[0-9A-Z]{16}"#, "aws-access-key"),
         (r#"ghp_[A-Za-z0-9]{20,}"#, "github-token"),
-        (r#"sk-[A-Za-z0-9]{20,}"#, "openai-style-key"),
         (r#"sk_live_[A-Za-z0-9]{16,}"#, "stripe-live-key"),
         (r#"rk_live_[A-Za-z0-9]{16,}"#, "stripe-restricted-key"),
         (r#"xox[baprs]-[A-Za-z0-9\-]{10,}"#, "slack-token"),
         (r#"AIza[0-9A-Za-z_\-]{35}"#, "google-api-key"),
         (r#"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"#, "private-key"),
         (r#"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"#, "jwt"),
+        // Second batch: only prefix-anchored, high-confidence formats.
+        (r#"sk-(?:proj-)?[A-Za-z0-9_\-]{20,}"#, "openai-key"),
+        (r#"sk-ant-[A-Za-z0-9_\-]{20,}"#, "anthropic-key"),
+        (r#"github_pat_[A-Za-z0-9_]{20,}"#, "github-fine-grained-pat"),
+        (r#"gho_[A-Za-z0-9]{36,}"#, "github-oauth-token"),
+        (r#"glpat-[A-Za-z0-9_\-]{20}"#, "gitlab-pat"),
+        (r#"npm_[A-Za-z0-9]{36}"#, "npm-token"),
+        (r#"pypi-[A-Za-z0-9_\-]{20,}"#, "pypi-token"),
+        (r#"SG\.[\w\-]{22}\.[\w\-]{43}"#, "sendgrid-key"),
+        (r#"SK[0-9a-f]{32}"#, "twilio-key"),
+        (r#"key-[0-9a-f]{32}"#, "mailgun-key"),
+        (r#"sq0atp-[A-Za-z0-9_\-]{22}"#, "square-token"),
+        (r#"shpat_[0-9a-f]{32}"#, "shopify-token"),
+        (r#"(?i)aws_secret_access_key\s*[:=]\s*["'][A-Za-z0-9/+=]{40}["']"#, "aws-secret-key"),
+        (r#"[0-9]{8,10}:[A-Za-z0-9_\-]{35}"#, "telegram-bot-token"),
+        (r#"(?i)(?:postgres|mysql|mongodb)(?:\+\w+)?://[^\s:"']+:[^\s@"']+@"#, "db-url-with-password"),
     ];
     let mut hits = Vec::new();
     for (pat, label) in patterns {
@@ -969,5 +984,15 @@ mod tests {
         assert!(hits.iter().any(|h| h.contains("stripe-live-key")));
         assert!(hits.iter().any(|h| h.contains("slack-token")));
         assert!(secret_hits("hello world").is_empty());
+    }
+
+    #[test]
+    fn more_secret_patterns_hit() {
+        let content = "npm_token = \"npm_abcdefghijklmnopqrstuvwxyz1234567890\" glpat = \"glpat-abcdefghijklmnopqrst\" sg = \"SG.abcdefghijklmnopqrstuv.abcdefghijklmnopqrstuvwxyz12345678901234567\" db = \"postgres://user:pass123@db.example.com/app\"";
+        let hits = secret_hits(content);
+        assert!(hits.iter().any(|h| h.contains("npm-token")), "hits: {:?}", hits);
+        assert!(hits.iter().any(|h| h.contains("gitlab-pat")), "hits: {:?}", hits);
+        assert!(hits.iter().any(|h| h.contains("sendgrid-key")), "hits: {:?}", hits);
+        assert!(hits.iter().any(|h| h.contains("db-url-with-password")), "hits: {:?}", hits);
     }
 }
