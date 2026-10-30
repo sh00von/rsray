@@ -42,8 +42,13 @@ rsray app.js
 # One remote bundle, JSON output
 rsray https://example.com/app.js --json -o endpoints.json
 
-# A whole website: crawl the page, collect its scripts, extract
+# A whole website: crawl up to 20 internal pages, sitemap, robots.txt,
+# source maps and chunk references, then extract
 rsray https://example.com --wordlist words.txt -o endpoints.txt
+
+# Hunter output: full URLs only, or flagged endpoints only
+rsray https://example.com --urls -o urls.txt
+rsray https://example.com --interesting-only
 
 # Many JS URLs, one per line
 cat js_urls.txt | rsray --stdin
@@ -66,14 +71,19 @@ rsray ./bundles/ --scope example.com -q | httpx -silent
 | `--wordlist <file>` | Also write a target wordlist |
 | `--scope <domain>` | Only report endpoints for this domain |
 | `--stdin` | Read inputs from stdin |
-| `--depth <n>` | Chunk-follow depth when crawling (default 1) |
+| `--depth <n>` | Chunk-follow depth when crawling (default 5) |
+| `--max-pages <n>` | Internal pages to crawl (default 20, 0 = homepage only) |
+| `--concurrency <n>` | Parallel script fetches (default 16) |
+| `--interesting-only` | Only flagged endpoints (admin, internal, debug, etc) |
+| `--urls` | Full URLs only, ready for httpx/ffuf |
+| `--no-color` | Disable terminal colours |
 
 ## How it works
 
 1. **Input** — a file, a directory, a JS URL, a website, or a list from stdin.
-2. **Fetch** — site mode collects `<script src>` tags and fetches them in parallel, then follows chunk references inside bundles.
-3. **Extract** — string literals are tokenised, literals joined by `+` are re-joined, `const API = "..."` base URLs are resolved, and `` `/api/users/${id}` `` becomes `/api/users/{id}`.
-4. **Classify** — API routes, page routes, static assets, external hosts, and WebSockets, with flags for `admin`, `internal`, `debug`, `staging`, versioned APIs, and parameterised routes.
+2. **Fetch** — site mode crawls internal pages, sitemap.xml and robots.txt, fetches scripts in parallel, follows chunk references recursively, and fetches source maps.
+3. **Extract** — string literals are tokenised, literals joined by `+` are re-joined, `const API = "..."` base URLs are resolved, and `` `/api/users/${id}` `` becomes `/api/users/{id}`. A language-aware regex pass also catches endpoints in Python, Go, PHP, Ruby, Java and JSON code. Multi-byte text (for example Bangla) is handled without panics.
+4. **Classify** — API routes (`/api`, `/rest`, `/graphql`, `/v1`..), page routes, static assets, external hosts, and WebSockets, with flags for `admin`, `internal`, `debug`, `staging`, versioned APIs, and parameterised routes. Colours appear only on a real terminal, never in JSON, CSV or piped output.
 5. **Output** — grouped terminal output, JSON, CSV, or plain text, plus an optional wordlist.
 
 ## Example output

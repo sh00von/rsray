@@ -53,18 +53,39 @@ fn is_static_path(path: &str) -> bool {
 }
 
 /// Guess an HTTP method from nearby code, best effort. Defaults to GET.
+/// Covers JS/TS (fetch method, axios.*), Python (requests.*),
+/// Go (http.Get/Post), PHP (CURLOPT_POST) and generic .post() calls.
 pub fn guess_method(snippet: &str) -> String {
     let lower = snippet.to_lowercase();
     for m in ["post", "put", "delete", "patch"] {
         if lower.contains(&format!("method: \"{}\"", m))
             || lower.contains(&format!("method: '{}'", m))
             || lower.contains(&format!("method:{}", m))
+            || lower.contains(&format!("requests.{}", m))
+            || lower.contains(&format!("axios.{}", m))
+            || lower.contains(&format!("http.{}", m))
             || lower.contains(&format!(".{}", m))
+            || (m == "post" && lower.contains("curlopt_post"))
         {
             return m.to_uppercase();
         }
     }
+    if lower.contains("requests.get") || lower.contains("http.get") || lower.contains("axios.get") {
+        return "GET".to_string();
+    }
     "GET".to_string()
+}
+
+/// API-looking paths across frameworks: /api, /rest, /graphql,
+/// /v1..v9, and bare api/ relative paths.
+pub fn is_api_path(path: &str) -> bool {
+    path.starts_with("/api/")
+        || path == "/api"
+        || path.starts_with("/rest/")
+        || path == "/rest"
+        || path.starts_with("/graphql")
+        || path.starts_with("api/")
+        || regex_api_version(path)
 }
 
 pub fn classify(value: &str, source_file: &str, snippet: &str, scope: Option<&str>) -> Option<Endpoint> {
@@ -99,9 +120,7 @@ pub fn classify(value: &str, source_file: &str, snippet: &str, scope: Option<&st
         }
         // External if it has a host and the path is not an API path
         // on the same site; we still classify API-looking ones as Api.
-        let is_api = path.starts_with("/api/")
-            || path.starts_with("/graphql")
-            || regex_api_version(&path);
+        let is_api = is_api_path(&path);
         if is_static_path(&path) {
             (Class::Static, path)
         } else if is_api {
@@ -115,11 +134,7 @@ pub fn classify(value: &str, source_file: &str, snippet: &str, scope: Option<&st
         // Relative / absolute path.
         if is_static_path(value) {
             (Class::Static, value.to_string())
-        } else if value.starts_with("/api/")
-            || value.starts_with("/graphql")
-            || regex_api_version(value)
-            || value.starts_with("api/")
-        {
+        } else if is_api_path(value) {
             (Class::Api, value.to_string())
         } else {
             (Class::Page, value.to_string())
@@ -183,6 +198,12 @@ mod tests {
     fn admin_is_flagged() {
         let e = classify("/api/v1/admin/users", "app.js", "", None).unwrap();
         assert!(e.flags.contains(&"admin".to_string()));
+    }
+
+    #[test]
+    fn rest_and_graphql_are_api() {
+        assert_eq!(classify("/rest/continue-code", "app.js", "", None).unwrap().class, Class::Api);
+        assert_eq!(classify("/graphql", "app.js", "", None).unwrap().class, Class::Api);
     }
 
     #[test]

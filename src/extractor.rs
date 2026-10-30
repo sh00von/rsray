@@ -290,11 +290,40 @@ fn const_joined_values(src: &str, literals: &[Literal], consts: &HashMap<String,
     out
 }
 
+/// Language-aware regex pass: catches endpoint patterns in code
+/// written in any language (Python requests, Go http, PHP curl,
+/// Ruby, Java, JSON, HTML) where the string-literal tokenizer
+/// alone might miss f-strings, format strings or split literals.
+/// This is a second pass, deduplicated against the literal pass.
+fn regex_pass(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(re) = regex::Regex::new(r#"https?://[^\s"'`<>]+|/api/[^\s"'`<>]+|/rest/[^\s"'`<>]+|/graphql[^\s"'`<>]*"#) {
+        for m in re.find_iter(src) {
+            let mut v = m.as_str().trim_end_matches(|c| ".,;:)}]".contains(c)).to_string();
+            // Strip a trailing quote/backtick the regex may have kept.
+            while v.ends_with('"') || v.ends_with('\'') || v.ends_with('`') {
+                v.pop();
+            }
+            // Skip raw template literals: the literal pass already
+            // converts ${...} to {param}, and keeping both would
+            // duplicate every templated endpoint.
+            if v.contains("${") {
+                continue;
+            }
+            if looks_like_endpoint(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
 pub fn extract_from_js(src: &str) -> Vec<RawEndpoint> {
     let literals = scan_literals(src);
     let consts = collect_consts(src, &literals);
     let mut combined = combine_literals(src, literals.clone(), &consts);
     combined.extend(const_joined_values(src, &literals, &consts));
+    combined.extend(regex_pass(src));
 
     let mut out: Vec<RawEndpoint> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -369,6 +398,14 @@ mod tests {
         let src = "const title = \"গগগগগগগগগগগগগগগ\"; fetch(\"/api/movies\"); const tail = \"গগগগগগগগগগগগগগগ\";";
         let v = values(src);
         assert!(v.contains(&"/api/movies".to_string()));
+    }
+
+    #[test]
+    fn python_and_go_calls_are_found() {
+        let v = values("import requests\nrequests.post('https://api.example.com/v1/login', data={})");
+        assert!(v.contains(&"https://api.example.com/v1/login".to_string()));
+        let v = values("resp, _ := http.Get(\"/api/v2/status\")");
+        assert!(v.contains(&"/api/v2/status".to_string()));
     }
 
     #[test]

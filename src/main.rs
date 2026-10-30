@@ -75,9 +75,29 @@ struct Args {
     #[arg(long)]
     stdin: bool,
 
-    /// Chunk-follow depth when crawling a site (default 1).
-    #[arg(long, default_value = "1")]
+    /// Chunk-follow depth when crawling a site (default 5).
+    #[arg(long, default_value = "5")]
     depth: usize,
+
+    /// Maximum internal pages to crawl from a site (default 20, 0 = homepage only).
+    #[arg(long, default_value = "20")]
+    max_pages: usize,
+
+    /// Parallel fetch concurrency for site scripts (default 16).
+    #[arg(long, default_value = "16")]
+    concurrency: usize,
+
+    /// Only show endpoints flagged interesting (admin, internal, debug, etc).
+    #[arg(long)]
+    interesting_only: bool,
+
+    /// Output full URLs only, one per line, ready for httpx/ffuf.
+    #[arg(long)]
+    urls: bool,
+
+    /// Disable colours even on a terminal.
+    #[arg(long)]
+    no_color: bool,
 }
 
 struct Source {
@@ -87,14 +107,90 @@ struct Source {
 
 fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .user_agent("rsray/0.1.0 (endpoint extraction; authorised testing only)")
-        .timeout(Duration::from_secs(20))
+        .user_agent("rsray (endpoint extraction; authorised testing only)")
+        .timeout(Duration::from_secs(10))
         .build()
         .expect("http client")
 }
 
+/// Quiet fetch: returns None on failure without printing, for
+/// optional files like source maps, sitemaps and robots.txt.
+fn fetch_url_quiet(client: &reqwest::blocking::Client, url: &str) -> Option<String> {
+    let resp = client.get(url).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.text().ok()
+}
+
+/// Fetch many URLs in parallel, using a thread per URL.
+/// Returns (url, body) pairs for the URLs that succeeded, in URL order.
+fn fetch_many(
+    client: &reqwest::blocking::Client,
+    urls: &[String],
+    concurrency: usize,
+) -> Vec<(String, String)> {
+    use std::sync::Mutex;
+    let concurrency = concurrency.max(1);
+    let mut all: Vec<(String, String)> = Vec::new();
+    for chunk in urls.chunks(concurrency) {
+        let results: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for url in chunk {
+                let cl = client.clone();
+                let url = url.clone();
+                let results = &results;
+                scope.spawn(move || {
+                    if let Some(body) = fetch_url_quiet(&cl, &url) {
+                        results.lock().unwrap().push((url, body));
+                    }
+                });
+            }
+        });
+        all.extend(results.into_inner().unwrap());
+    }
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    all
+}
+
+/// Internal <a href> links on a page, same host only.
+fn internal_links(html: &str, base: &str, host: &str) -> Vec<String> {
+    let re = Regex::new(r#"(?i)<a[^>]+href=["']([^"']+)["']"#).unwrap();
+    let mut out = Vec::new();
+    for cap in re.captures_iter(html) {
+        if let Some(m) = cap.get(1) {
+            let href = m.as_str().trim();
+            if href.is_empty() || href.starts_with('#') || href.starts_with("mailto:") || href.starts_with("tel:") || href.starts_with("javascript:") {
+                continue;
+            }
+            let url = resolve_url(base, href);
+            let url = url.split('#').next().unwrap_or(&url).to_string();
+            if host_of_url(&url).as_deref() == Some(host) {
+                let lower = url.to_lowercase();
+                if !lower.ends_with(".css") && !lower.ends_with(".png") && !lower.ends_with(".jpg") && !lower.ends_with(".jpeg") && !lower.ends_with(".gif") && !lower.ends_with(".svg") && !lower.ends_with(".ico") {
+                    out.push(url);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// URLs listed in a sitemap.xml body.
+fn sitemap_urls(xml: &str, host: &str) -> Vec<String> {
+    let re = Regex::new(r"<loc>([^<]+)</loc>").unwrap();
+    re.captures_iter(xml)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
+        .filter(|u| host_of_url(u).as_deref() == Some(host))
+        .collect()
+}
+
 fn fetch_url(client: &reqwest::blocking::Client, url: &str) -> Option<String> {
     match client.get(url).send() {
+        Ok(resp) if !resp.status().is_success() => {
+            eprintln!("rsray: could not fetch {}: HTTP {}", url, resp.status());
+            None
+        }
         Ok(resp) => match resp.text() {
             Ok(t) => Some(t),
             Err(e) => {
@@ -169,7 +265,7 @@ fn collect_from_dir(dir: &Path, out: &mut Vec<Source>) {
             if path.is_dir() {
                 collect_from_dir(&path, out);
             } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext == "js" || ext == "mjs" || ext == "cjs" {
+                if ["js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "go", "php", "rb", "java", "json", "html", "htm"].contains(&ext) {
                     if let Ok(content) = fs::read_to_string(&path) {
                         out.push(Source { name: path.display().to_string(), content });
                     }
@@ -188,7 +284,7 @@ fn progress(start: &Instant, quiet: bool, msg: &str) {
 }
 
 /// Gather all JS sources for one input string.
-fn gather(input: &str, depth: usize, start: &Instant, quiet: bool) -> Vec<Source> {
+fn gather(input: &str, depth: usize, start: &Instant, quiet: bool, max_pages: usize, concurrency: usize) -> Vec<Source> {
     let path = Path::new(input);
     if path.is_file() {
         if let Ok(content) = fs::read_to_string(path) {
@@ -212,7 +308,7 @@ fn gather(input: &str, depth: usize, start: &Instant, quiet: bool) -> Vec<Source
             let mut sources = vec![Source { name: input.to_string(), content: body.clone() }];
             // Try the source map next to the bundle.
             let map_url = format!("{}.map", input);
-            if let Some(map) = fetch_url(&cl, &map_url) {
+            if let Some(map) = fetch_url_quiet(&cl, &map_url) {
                 sources.push(Source { name: map_url, content: map });
             }
             return sources;
@@ -220,44 +316,122 @@ fn gather(input: &str, depth: usize, start: &Instant, quiet: bool) -> Vec<Source
         if input.ends_with(".map") {
             return vec![Source { name: input.to_string(), content: body }];
         }
-        // Otherwise treat it as a website: fetch its scripts.
+        // Otherwise treat it as a website: crawl its pages, then fetch
+        // all scripts in parallel, then follow chunks recursively.
+        let host = host_of_url(input).unwrap_or_default();
+        let origin = {
+            let (scheme, rest) = input.split_once("://").unwrap_or(("https", input));
+            let h = rest.split('/').next().unwrap_or("");
+            format!("{}://{}", scheme, h)
+        };
         let mut sources: Vec<Source> = Vec::new();
-        let mut queue: Vec<String> = script_srcs(&body).into_iter().map(|s| resolve_url(input, &s)).collect();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut current_depth = 0usize;
-        while !queue.is_empty() && current_depth <= depth {
-            let mut next_queue: Vec<String> = Vec::new();
-            for url in queue {
-                if !seen.insert(url.clone()) {
-                    continue;
+        let mut script_urls: Vec<String> = Vec::new();
+        let mut seen_scripts: HashSet<String> = HashSet::new();
+        // Crawl pages: homepage first, then internal links, sitemap, robots.
+        let mut page_queue: Vec<String> = vec![input.to_string()];
+        let mut seen_pages: HashSet<String> = HashSet::new();
+        let mut pages_done = 0usize;
+        // Sitemap and robots are one-time seeds from the origin.
+        if let Some(xml) = fetch_url_quiet(&cl, &format!("{}/sitemap.xml", origin)) {
+            for u in sitemap_urls(&xml, &host) {
+                if !page_queue.contains(&u) {
+                    page_queue.push(u);
                 }
-                if let Some(js) = fetch_url(&cl, &url) {
-                    progress(start, quiet, &format!("fetched {} ({} bytes)", url, js.len()));
-                    if current_depth < depth {
-                        for chunk in chunk_refs(&js, &url) {
-                            if !seen.contains(&chunk) {
-                                next_queue.push(chunk);
+            }
+        }
+        let mut robots_disallow: Vec<String> = Vec::new();
+        if let Some(robots) = fetch_url_quiet(&cl, &format!("{}/robots.txt", origin)) {
+            for line in robots.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("Disallow:") {
+                    let p = rest.trim();
+                    if p.starts_with('/') {
+                        robots_disallow.push(p.to_string());
+                    }
+                }
+                if let Some(rest) = line.strip_prefix("Sitemap:") {
+                    let sm = rest.trim();
+                    if let Some(xml) = fetch_url_quiet(&cl, sm) {
+                        for u in sitemap_urls(&xml, &host) {
+                            if !page_queue.contains(&u) {
+                                page_queue.push(u);
                             }
                         }
                     }
-                    sources.push(Source { name: url, content: js });
                 }
             }
-            queue = next_queue;
-            current_depth += 1;
         }
-        // Also extract from inline scripts in the page itself.
-        let inline_re = Regex::new(r"(?is)<script([^>]*)>(.*?)</script>").unwrap();
-        for cap in inline_re.captures_iter(&body) {
-            let attrs = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            if !attrs.to_ascii_lowercase().contains("src=") {
-                if let Some(m) = cap.get(2) {
-                    let script = m.as_str().trim();
-                    if !script.is_empty() {
-                        sources.push(Source { name: format!("{} (inline)", input), content: script.to_string() });
+        if !robots_disallow.is_empty() {
+            // Disallowed paths are hunter gold: surface them as a source
+            // so the extractor finds them as endpoints.
+            sources.push(Source { name: format!("{}/robots.txt", origin), content: robots_disallow.join("\n") });
+        }
+        while let Some(page) = page_queue.first().cloned() {
+            page_queue.remove(0);
+            if !seen_pages.insert(page.clone()) {
+                continue;
+            }
+            if max_pages > 0 && pages_done >= max_pages {
+                break;
+            }
+            pages_done += 1;
+            let page_body = if page == input { body.clone() } else { match fetch_url_quiet(&cl, &page) { Some(b) => b, None => continue } };
+            for s in script_srcs(&page_body) {
+                let u = resolve_url(&page, &s);
+                if seen_scripts.insert(u.clone()) {
+                    script_urls.push(u);
+                }
+            }
+            // Inline scripts on every crawled page.
+            let inline_re = Regex::new(r"(?is)<script([^>]*)>(.*?)</script>").unwrap();
+            for cap in inline_re.captures_iter(&page_body) {
+                let attrs = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                if !attrs.to_ascii_lowercase().contains("src=") {
+                    if let Some(m) = cap.get(2) {
+                        let script = m.as_str().trim();
+                        if !script.is_empty() {
+                            sources.push(Source { name: format!("{} (inline)", page), content: script.to_string() });
+                        }
                     }
                 }
             }
+            if max_pages == 0 {
+                break;
+            }
+            for link in internal_links(&page_body, &page, &host) {
+                if !seen_pages.contains(&link) && !page_queue.contains(&link) {
+                    page_queue.push(link);
+                }
+            }
+        }
+        // Fetch scripts in parallel, following chunks level by level.
+        let mut queue = script_urls;
+        let mut seen: HashSet<String> = seen_scripts;
+        let mut current_depth = 0usize;
+        while !queue.is_empty() && current_depth <= depth {
+            let fetched = fetch_many(&cl, &queue, concurrency);
+            let mut next_queue: Vec<String> = Vec::new();
+            let mut fetched_urls: Vec<String> = Vec::new();
+            for (url, js) in fetched {
+                progress(start, quiet, &format!("fetched {} ({} bytes)", url, js.len()));
+                fetched_urls.push(url.clone());
+                if current_depth < depth {
+                    for chunk in chunk_refs(&js, &url) {
+                        if !seen.contains(&chunk) {
+                            seen.insert(chunk.clone());
+                            next_queue.push(chunk);
+                        }
+                    }
+                }
+                sources.push(Source { name: url, content: js });
+            }
+            // Source maps for this level, in parallel, quietly.
+            let map_urls: Vec<String> = fetched_urls.iter().map(|u| format!("{}.map", u)).collect();
+            for (map_url, map) in fetch_many(&cl, &map_urls, concurrency) {
+                sources.push(Source { name: map_url, content: map });
+            }
+            queue = next_queue;
+            current_depth += 1;
         }
         return sources;
     }
@@ -364,7 +538,7 @@ fn main() {
 
     for input in &inputs {
         progress(&start, args.quiet, &format!("loading {}", input));
-        let sources = gather(&input, args.depth, &start, args.quiet);
+        let sources = gather(&input, args.depth, &start, args.quiet, args.max_pages, args.concurrency);
         files_scanned += sources.len();
         for source in sources {
             progress(&start, args.quiet, &format!("scanning {} ({} bytes)", source.name, source.content.len()));
@@ -393,9 +567,40 @@ fn main() {
     }
 
     all.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+    if args.interesting_only {
+        all.retain(|e| !e.flags.is_empty());
+    }
+
+    // Colours only on a real terminal, never in JSON/CSV/piped output.
+    let use_color = !args.no_color && !args.json && !args.csv && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let paint = |code: &str, text: &str| -> String {
+        if use_color {
+            format!("\x1b[{}m{}\x1b[0m", code, text)
+        } else {
+            text.to_string()
+        }
+    };
 
     let mut out_text = String::new();
-    if args.json {
+    if args.urls {
+        // Full URLs ready for httpx/ffuf: relative endpoints get the
+        // first site input's origin prepended.
+        let origin = inputs.iter().find(|i| i.starts_with("http")).map(|i| {
+            let (scheme, rest) = i.split_once("://").unwrap_or(("https", i.as_str()));
+            let h = rest.split('/').next().unwrap_or("");
+            format!("{}://{}", scheme, h)
+        });
+        for e in &all {
+            if e.endpoint.starts_with("http://") || e.endpoint.starts_with("https://") || e.endpoint.starts_with("ws") {
+                out_text.push_str(&e.endpoint);
+            } else if let Some(o) = &origin {
+                out_text.push_str(&format!("{}{}", o, e.endpoint));
+            } else {
+                out_text.push_str(&e.endpoint);
+            }
+            out_text.push('\n');
+        }
+    } else if args.json {
         let json_eps: Vec<JsonEndpoint> = all
             .iter()
             .map(|e| JsonEndpoint { endpoint: &e.endpoint, source_file: &e.source_file, class: e.class, flags: &e.flags, method: &e.method })
@@ -425,9 +630,9 @@ fn main() {
                 if list.is_empty() {
                     continue;
                 }
-                out_text.push_str(&format!("\n== {} ({}) ==\n", title, list.len()));
+                out_text.push_str(&format!("\n{}\n", paint("1;36", &format!("== {} ({}) ==", title, list.len()))));
                 for e in list {
-                    let flag_str = if e.flags.is_empty() { String::new() } else { format!(" [{}]", e.flags.join(",")) };
+                    let flag_str = if e.flags.is_empty() { String::new() } else { format!(" [{}]", paint("33", &e.flags.join(","))) };
                     out_text.push_str(&format!("  {} {}{}\n", e.method, e.endpoint, flag_str));
                     if args.verbose {
                         out_text.push_str(&format!("     from {} :: {}\n", e.source_file, snippet_map.get(&e.endpoint).cloned().unwrap_or_default()));
@@ -442,7 +647,7 @@ fn main() {
         }
     }
 
-    if args.quiet && !args.json && !args.csv {
+    if args.quiet && !args.json && !args.csv && !args.urls {
         out_text.clear();
         for e in &all {
             out_text.push_str(&e.endpoint);
