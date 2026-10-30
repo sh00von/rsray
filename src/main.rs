@@ -1,0 +1,451 @@
+//! rsray — X-ray into JavaScript bundles.
+//!
+//! Usage:
+//!   rsray app.js
+//!   rsray https://example.com/app.js --json -o endpoints.json
+//!   rsray https://example.com --wordlist words.txt
+//!   cat js_urls.txt | rsray --stdin
+//!
+//! Only run rsray on sites you own or targets you are authorised to test.
+
+mod classifier;
+mod extractor;
+
+use classifier::{Class, Endpoint};
+use clap::Parser;
+use extractor::RawEndpoint;
+use regex::Regex;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[derive(Parser, Debug)]
+#[command(name = "rsray", version, about = "X-ray into JavaScript bundles. Find the hidden API surface.")]
+struct Args {
+    /// Input: a JS file, a directory, a JS URL, or a website URL.
+    /// Use "-" or --stdin to read a list of inputs from stdin.
+    input: Option<String>,
+
+    /// Write results to a file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// JSON output.
+    #[arg(long)]
+    json: bool,
+
+    /// CSV output.
+    #[arg(long)]
+    csv: bool,
+
+    /// Endpoints only, no summary.
+    #[arg(short, long)]
+    quiet: bool,
+
+    /// Show source file and code snippet per endpoint.
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Also list static asset paths (images, CSS, fonts).
+    #[arg(long)]
+    include_static: bool,
+
+    /// Also report endpoints on external domains (site mode only).
+    #[arg(long)]
+    include_external: bool,
+
+    /// Also report high-confidence secret patterns (off by default).
+    #[arg(long)]
+    secrets: bool,
+
+    /// Also write a target wordlist to this file.
+    #[arg(long)]
+    wordlist: Option<PathBuf>,
+
+    /// Only report endpoints for this domain (e.g. example.com).
+    #[arg(long)]
+    scope: Option<String>,
+
+    /// Read inputs (one per line) from stdin.
+    #[arg(long)]
+    stdin: bool,
+
+    /// Chunk-follow depth when crawling a site (default 1).
+    #[arg(long, default_value = "1")]
+    depth: usize,
+}
+
+struct Source {
+    name: String,
+    content: String,
+}
+
+fn client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .user_agent("rsray/0.1.0 (endpoint extraction; authorised testing only)")
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect("http client")
+}
+
+fn fetch_url(client: &reqwest::blocking::Client, url: &str) -> Option<String> {
+    match client.get(url).send() {
+        Ok(resp) => match resp.text() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("rsray: could not read {}: {}", url, e);
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("rsray: could not fetch {}: {}", url, e);
+            None
+        }
+    }
+}
+
+/// Resolve a possibly-relative script URL against a base page URL.
+fn resolve_url(base: &str, rel: &str) -> String {
+    if rel.starts_with("http://") || rel.starts_with("https://") || rel.starts_with("//") {
+        if rel.starts_with("//") {
+            let scheme = base.split("://").next().unwrap_or("https");
+            return format!("{}:{}", scheme, rel);
+        }
+        return rel.to_string();
+    }
+    // Base origin + path handling.
+    let (scheme_host, base_path) = match base.split_once("://") {
+        Some((scheme, rest)) => {
+            let host = rest.split('/').next().unwrap_or("");
+            let path = rest[rest.len().min(host.len())..].to_string();
+            (format!("{}://{}", scheme, host), path)
+        }
+        None => (String::new(), base.to_string()),
+    };
+    if rel.starts_with('/') {
+        return format!("{}{}", scheme_host, rel);
+    }
+    // Relative to the base page's directory.
+    let dir = match base_path.rfind('/') {
+        Some(i) => &base_path[..=i],
+        None => "/",
+    };
+    format!("{}{}{}", scheme_host, dir, rel)
+}
+
+fn host_of_url(url: &str) -> Option<String> {
+    url.split("://").nth(1).and_then(|rest| rest.split('/').next()).map(|s| s.to_string())
+}
+
+/// Extract <script src="..."> values from HTML (regex is enough here:
+/// we only need src attributes, not a full DOM parse).
+fn script_srcs(html: &str) -> Vec<String> {
+    let re = Regex::new(r#"(?i)<script[^>]+src=["']([^"']+)["']"#).unwrap();
+    re.captures_iter(html).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())).collect()
+}
+
+/// JS chunk references inside a bundle: strings ending in .js that look
+/// like chunk files (used for depth-following).
+fn chunk_refs(js: &str, base_url: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in extractor::extract_from_js(js) {
+        let v = raw.value;
+        if v.ends_with(".js") && !v.starts_with("http") {
+            out.push(resolve_url(base_url, &v));
+        }
+    }
+    out
+}
+
+fn collect_from_dir(dir: &Path, out: &mut Vec<Source>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_from_dir(&path, out);
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext == "js" || ext == "mjs" || ext == "cjs" {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        out.push(Source { name: path.display().to_string(), content });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Gather all JS sources for one input string.
+fn gather(input: &str, depth: usize) -> Vec<Source> {
+    let path = Path::new(input);
+    if path.is_file() {
+        if let Ok(content) = fs::read_to_string(path) {
+            return vec![Source { name: input.to_string(), content }];
+        }
+        return vec![];
+    }
+    if path.is_dir() {
+        let mut out = Vec::new();
+        collect_from_dir(path, &mut out);
+        return out;
+    }
+    if input.starts_with("http://") || input.starts_with("https://") {
+        let cl = client();
+        let body = match fetch_url(&cl, input) {
+            Some(b) => b,
+            None => return vec![],
+        };
+        if input.ends_with(".js") {
+            let mut sources = vec![Source { name: input.to_string(), content: body.clone() }];
+            // Try the source map next to the bundle.
+            let map_url = format!("{}.map", input);
+            if let Some(map) = fetch_url(&cl, &map_url) {
+                sources.push(Source { name: map_url, content: map });
+            }
+            return sources;
+        }
+        if input.ends_with(".map") {
+            return vec![Source { name: input.to_string(), content: body }];
+        }
+        // Otherwise treat it as a website: fetch its scripts.
+        let mut sources: Vec<Source> = Vec::new();
+        let mut queue: Vec<String> = script_srcs(&body).into_iter().map(|s| resolve_url(input, &s)).collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut current_depth = 0usize;
+        while !queue.is_empty() && current_depth <= depth {
+            let mut next_queue: Vec<String> = Vec::new();
+            for url in queue {
+                if !seen.insert(url.clone()) {
+                    continue;
+                }
+                if let Some(js) = fetch_url(&cl, &url) {
+                    if current_depth < depth {
+                        for chunk in chunk_refs(&js, &url) {
+                            if !seen.contains(&chunk) {
+                                next_queue.push(chunk);
+                            }
+                        }
+                    }
+                    sources.push(Source { name: url, content: js });
+                }
+            }
+            queue = next_queue;
+            current_depth += 1;
+        }
+        // Also extract from inline scripts in the page itself.
+        let inline_re = Regex::new(r"(?is)<script(?![^>]+src=)[^>]*>(.*?)</script>").unwrap();
+        for cap in inline_re.captures_iter(&body) {
+            if let Some(m) = cap.get(1) {
+                sources.push(Source { name: format!("{} (inline)", input), content: m.as_str().to_string() });
+            }
+        }
+        return sources;
+    }
+    eprintln!("rsray: cannot read input: {}", input);
+    vec![]
+}
+
+fn wordlist_from(endpoints: &[Endpoint]) -> Vec<String> {
+    let mut words: HashSet<String> = HashSet::new();
+    for e in endpoints {
+        let path = e.endpoint.split("://").nth(1).and_then(|rest| rest.find('/').map(|i| &rest[i..])).unwrap_or(&e.endpoint);
+        for seg in path.split(|c| "/?&=#".contains(c)) {
+            let clean = seg.trim_matches(|c| "{}[]".contains(c));
+            if clean.len() >= 2 && clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                words.insert(clean.to_string());
+            }
+        }
+    }
+    let mut v: Vec<String> = words.into_iter().collect();
+    v.sort();
+    v
+}
+
+fn secret_hits(content: &str) -> Vec<String> {
+    let patterns = [
+        (r#"(?i)(api[_-]?key|apikey)\s*[:=]\s*["'][A-Za-z0-9_\-]{16,}["']"#, "api-key"),
+        (r#"(?i)(secret|token)\s*[:=]\s*["'][A-Za-z0-9_\-\.]{20,}["']"#, "token/secret"),
+        (r#"AKIA[0-9A-Z]{16}"#, "aws-access-key"),
+        (r#"ghp_[A-Za-z0-9]{20,}"#, "github-token"),
+        (r#"sk-[A-Za-z0-9]{20,}"#, "openai-style-key"),
+    ];
+    let mut hits = Vec::new();
+    for (pat, label) in patterns {
+        if let Ok(re) = Regex::new(pat) {
+            for m in re.find_iter(content) {
+                let snippet = &content[m.start().saturating_sub(10)..m.end().min(content.len())];
+                hits.push(format!("{}: {}", label, snippet.chars().take(60).collect::<String>()));
+            }
+        }
+    }
+    hits
+}
+
+#[derive(Serialize)]
+struct JsonEndpoint<'a> {
+    endpoint: &'a str,
+    source_file: &'a str,
+    class: Class,
+    flags: &'a [String],
+    method: &'a str,
+}
+
+fn main() {
+    let args = Args::parse();
+
+    let mut inputs: Vec<String> = Vec::new();
+    if args.stdin || args.input.as_deref() == Some("-") {
+        let mut buf = String::new();
+        if io::stdin().read_to_string(&mut buf).is_ok() {
+            for line in buf.lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    inputs.push(line.to_string());
+                }
+            }
+        }
+    } else if let Some(input) = &args.input {
+        inputs.push(input.clone());
+    } else {
+        eprintln!("Usage: rsray <file.js | dir/ | https://site.com | https://site.com/app.js>");
+        eprintln!("       cat js_urls.txt | rsray --stdin");
+        std::process::exit(2);
+    }
+
+    // Effective scope: explicit --scope, else the host of a site input.
+    let mut scope: Option<String> = args.scope.clone();
+    if scope.is_none() && !args.include_external {
+        for input in &inputs {
+            if input.starts_with("http") && !input.ends_with(".js") && !input.ends_with(".map") {
+                scope = host_of_url(input);
+                break;
+            }
+        }
+    }
+    if args.include_external {
+        scope = args.scope.clone();
+    }
+
+    let mut all: Vec<Endpoint> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut secret_list: Vec<String> = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut snippet_map: HashMap<String, String> = HashMap::new();
+
+    for input in &inputs {
+        let sources = gather(&input, args.depth);
+        files_scanned += sources.len();
+        for source in sources {
+            let raws: Vec<RawEndpoint> = if source.name.ends_with(".map") {
+                extractor::extract_from_sourcemap(&source.content)
+            } else {
+                extractor::extract_from_js(&source.content)
+            };
+            if args.secrets {
+                for hit in secret_hits(&source.content) {
+                    secret_list.push(format!("{} :: {}", source.name, hit));
+                }
+            }
+            for raw in raws {
+                if let Some(ep) = classifier::classify(&raw.value, &source.name, &raw.snippet, scope.as_deref()) {
+                    if ep.class == Class::Static && !args.include_static {
+                        continue;
+                    }
+                    if seen.insert(ep.endpoint.clone()) {
+                        snippet_map.insert(ep.endpoint.clone(), raw.snippet.clone());
+                        all.push(ep);
+                    }
+                }
+            }
+        }
+    }
+
+    all.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+
+    let mut out_text = String::new();
+    if args.json {
+        let json_eps: Vec<JsonEndpoint> = all
+            .iter()
+            .map(|e| JsonEndpoint { endpoint: &e.endpoint, source_file: &e.source_file, class: e.class, flags: &e.flags, method: &e.method })
+            .collect();
+        out_text = serde_json::to_string_pretty(&json_eps).unwrap_or_else(|_| "[]".to_string());
+        out_text.push('\n');
+    } else if args.csv {
+        out_text.push_str("endpoint,source_file,class,flags,method\n");
+        for e in &all {
+            out_text.push_str(&format!("\"{}\",\"{}\",{:?},\"{}\",{}\n", e.endpoint.replace('"', "\"\""), e.source_file.replace('"', "\"\""), e.class, e.flags.join(";"), e.method));
+        }
+    } else {
+        // Grouped terminal output.
+        let mut groups: HashMap<&str, Vec<&Endpoint>> = HashMap::new();
+        for e in &all {
+            let key = match e.class {
+                Class::Api => "API routes",
+                Class::Page => "Page routes",
+                Class::Static => "Static assets",
+                Class::External => "External",
+                Class::Websocket => "WebSockets",
+            };
+            groups.entry(key).or_default().push(e);
+        }
+        for title in ["API routes", "Page routes", "External", "WebSockets", "Static assets"] {
+            if let Some(list) = groups.get(title) {
+                if list.is_empty() {
+                    continue;
+                }
+                out_text.push_str(&format!("\n== {} ({}) ==\n", title, list.len()));
+                for e in list {
+                    let flag_str = if e.flags.is_empty() { String::new() } else { format!(" [{}]", e.flags.join(",")) };
+                    out_text.push_str(&format!("  {} {}{}\n", e.method, e.endpoint, flag_str));
+                    if args.verbose {
+                        out_text.push_str(&format!("     from {} :: {}\n", e.source_file, snippet_map.get(&e.endpoint).cloned().unwrap_or_default()));
+                    }
+                }
+            }
+        }
+        if !args.quiet {
+            let api = all.iter().filter(|e| e.class == Class::Api).count();
+            let interesting = all.iter().filter(|e| !e.flags.is_empty()).count();
+            out_text.push_str(&format!("\nScanned {} source(s). Found {} endpoints ({} API, {} flagged interesting).\n", files_scanned, all.len(), api, interesting));
+        }
+    }
+
+    if args.quiet && !args.json && !args.csv {
+        out_text.clear();
+        for e in &all {
+            out_text.push_str(&e.endpoint);
+            out_text.push('\n');
+        }
+    }
+
+    match &args.output {
+        Some(path) => {
+            if let Err(e) = fs::write(path, &out_text) {
+                eprintln!("rsray: could not write {}: {}", path.display(), e);
+                std::process::exit(1);
+            }
+            if !args.quiet {
+                eprintln!("rsray: wrote {} endpoints to {}", all.len(), path.display());
+            }
+        }
+        None => print!("{}", out_text),
+    }
+
+    if let Some(wordlist_path) = &args.wordlist {
+        let words = wordlist_from(&all);
+        if let Err(e) = fs::write(wordlist_path, words.join("\n") + "\n") {
+            eprintln!("rsray: could not write wordlist: {}", e);
+        } else if !args.quiet {
+            eprintln!("rsray: wrote {} wordlist entries to {}", words.len(), wordlist_path.display());
+        }
+    }
+
+    if args.secrets && !secret_list.is_empty() {
+        eprintln!("\nSecrets (high-confidence patterns — review manually, do not trust blindly):");
+        for hit in secret_list.iter().take(50) {
+            eprintln!("  {}", hit);
+        }
+    }
+}

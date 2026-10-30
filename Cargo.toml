@@ -1,0 +1,22 @@
+[package]
+name = "rsray"
+version = "0.1.0"
+edition = "2021"
+description = "X-ray into JavaScript bundles. Find the hidden API surface."
+license = "MIT"
+repository = "https://github.com/sh00von/rsray"
+keywords = ["security", "recon", "javascript", "endpoints", "bug-bounty"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "rsray"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+
+[dev-dependencies]
