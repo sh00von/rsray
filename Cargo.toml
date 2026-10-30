@@ -2,7 +2,7 @@
 name = "rsray"
 version = "0.1.3"
 edition = "2021"
-description = "X-ray into JavaScript bundles. Find the hidden API surface."
+description = "Extract endpoints from JavaScript bundles and websites."
 license = "MIT"
 repository = "https://github.com/sh00von/rsray"
 keywords = ["security", "recon", "javascript", "endpoints", "bug-bounty"]
