@@ -1,0 +1,15 @@
+# rsray config example. Copy to rsray.toml and run:
+#   rsray https://example.com --config rsray.toml
+# CLI flags override these values.
+depth = 5
+max_pages = 20
+concurrency = 16
+timeout = 10
+delay_ms = 0
+retries = 1
+interesting_only = false
+urls = false
+header = ["Authorization: Bearer YOUR_TOKEN"]
+# cookie = "session=abc"
+# proxy = "http://127.0.0.1:8080"
+exclude = ["/logout"]

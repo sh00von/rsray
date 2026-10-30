@@ -151,6 +151,9 @@ pub fn classify(value: &str, source_file: &str, snippet: &str, scope: Option<&st
     if value.contains('{') || value.contains('?') {
         flags.push("parameterised".to_string());
     }
+    if lower.contains("graphql") {
+        flags.push("graphql".to_string());
+    }
     if lower.contains("/v1/") || lower.contains("/v2/") || lower.contains("/v3/") {
         flags.push("versioned".to_string());
     }
@@ -204,6 +207,12 @@ mod tests {
     fn rest_and_graphql_are_api() {
         assert_eq!(classify("/rest/continue-code", "app.js", "", None).unwrap().class, Class::Api);
         assert_eq!(classify("/graphql", "app.js", "", None).unwrap().class, Class::Api);
+    }
+
+    #[test]
+    fn graphql_is_flagged() {
+        let e = classify("/graphql", "app.js", "", None).unwrap();
+        assert!(e.flags.contains(&"graphql".to_string()));
     }
 
     #[test]

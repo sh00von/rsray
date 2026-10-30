@@ -63,7 +63,32 @@ rsray https://example.com --scope example.com
 rsray https://example.com --include-static
 rsray https://example.com --include-external
 rsray https://example.com --secrets
+rsray https://example.com --exclude "/logout" --exclude "/static"
 ```
+
+Authenticated scanning and proxy (authorized targets only):
+
+```bash
+rsray https://example.com --header "Authorization: Bearer TOKEN"
+rsray https://example.com --header "Authorization: Bearer TOKEN" --header "X-Custom: 1"
+rsray https://example.com --cookie "session=abc; other=1"
+rsray https://example.com --proxy http://127.0.0.1:8080
+```
+
+HAR input:
+
+```bash
+rsray session.har --json -o endpoints.json
+```
+
+Config file:
+
+```bash
+rsray https://example.com --config rsray.toml
+```
+
+See `rsray.toml.example` for all supported keys. CLI flags
+override config values.
 
 Crawling (website input only):
 
@@ -101,6 +126,14 @@ ffuf -u https://example.com/FUZZ -w words.txt
 | `--depth <n>` | Chunk-follow depth (default: 5) |
 | `--max-pages <n>` | Internal pages to crawl (default: 20, 0 = homepage only) |
 | `--concurrency <n>` | Parallel script fetches (default: 16) |
+| `--header <h>` | Extra request header, repeatable |
+| `--cookie <v>` | Cookie header value |
+| `--proxy <url>` | HTTP(S) proxy, e.g. for Burp |
+| `--timeout <s>` | Per-request timeout in seconds (default: 10) |
+| `--delay-ms <n>` | Delay between crawled page fetches (default: 0) |
+| `--retries <n>` | Retries on network errors and 5xx (default: 0) |
+| `--exclude <s>` | Skip URLs containing this substring, repeatable |
+| `--config <file>` | TOML config file |
 | `--interesting-only` | Only endpoints flagged admin, internal, debug, staging, test, beta, backup, old, versioned, or parameterised |
 | `--urls` | Full URLs only, one per line |
 | `--no-color` | Disable terminal colours |
@@ -138,7 +171,8 @@ piped output.
 
 Site mode crawls internal pages, sitemap.xml, and robots.txt,
 fetches scripts in parallel, follows chunk references recursively,
-and fetches source maps.
+fetches source maps, and fetches `_next/data` JSON for Next.js
+pages when a buildId is found.
 
 Extraction combines a string tokenizer, an SWC parse, and a
 language-aware regex pass. It handles string concatenation,
