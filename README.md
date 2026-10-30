@@ -14,6 +14,14 @@ cargo install rsray
 
 Also on crates.io: https://crates.io/crates/rsray
 
+## Prebuilt binaries
+
+No Rust needed. Download the latest release from https://github.com/sh00von/rsray/releases/latest
+
+- Linux: rsray-Linux.tar.gz
+- macOS: rsray-macOS.tar.gz
+- Windows: rsray-Windows.zip
+
 From source:
 
 ```bash
