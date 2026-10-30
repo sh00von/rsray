@@ -235,8 +235,17 @@ fn looks_like_endpoint(v: &str) -> bool {
 
 fn snippet_around(src: &str, needle: &str) -> String {
     if let Some(pos) = src.find(needle) {
-        let start = pos.saturating_sub(40);
-        let end = (pos + needle.len() + 40).min(src.len());
+        // Byte offsets can split a multi-byte UTF-8 character (for
+        // example Bangla text in a bundle). Move to the nearest char
+        // boundaries first, otherwise this slice panics.
+        let mut start = pos.saturating_sub(40);
+        while !src.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = (pos + needle.len() + 40).min(src.len());
+        while !src.is_char_boundary(end) {
+            end -= 1;
+        }
         src[start..end].replace('\n', " ").trim().to_string()
     } else {
         needle.to_string()
@@ -350,6 +359,16 @@ mod tests {
     fn junk_strings_are_dropped() {
         let v = values(r#"const x = "hello world"; const y = "red";"#);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn bangla_text_does_not_panic_on_snippet_slice() {
+        // Regression test for the Star Cineplex panic: a Bangla string
+        // (3 bytes per character) sits within 40 bytes of an endpoint,
+        // so a raw byte slice would cut a character in half and panic.
+        let src = "const title = \"গগগগগগগগগগগগগগগ\"; fetch(\"/api/movies\"); const tail = \"গগগগগগগগগগগগগগগ\";";
+        let v = values(src);
+        assert!(v.contains(&"/api/movies".to_string()));
     }
 
     #[test]

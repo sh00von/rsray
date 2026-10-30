@@ -293,7 +293,15 @@ fn secret_hits(content: &str) -> Vec<String> {
     for (pat, label) in patterns {
         if let Ok(re) = Regex::new(pat) {
             for m in re.find_iter(content) {
-                let snippet = &content[m.start().saturating_sub(10)..m.end().min(content.len())];
+                let mut sstart = m.start().saturating_sub(10);
+                while !content.is_char_boundary(sstart) {
+                    sstart += 1;
+                }
+                let mut send = m.end().min(content.len());
+                while !content.is_char_boundary(send) {
+                    send -= 1;
+                }
+                let snippet = &content[sstart..send];
                 hits.push(format!("{}: {}", label, snippet.chars().take(60).collect::<String>()));
             }
         }
