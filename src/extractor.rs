@@ -318,12 +318,48 @@ fn regex_pass(src: &str) -> Vec<String> {
     out
 }
 
+/// Dedup key: template placeholders are normalised, so
+/// `/api/users/{user}/orders` (tokenizer) and
+/// `/api/users/{param}/orders` (SWC) count as the same endpoint.
+fn dedup_key(value: &str) -> String {
+    let mut out = String::new();
+    let mut in_brace = false;
+    for c in value.chars() {
+        if c == '{' {
+            in_brace = true;
+            out.push_str("{}");
+        } else if c == '}' {
+            in_brace = false;
+        } else if !in_brace {
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn extract_from_js(src: &str) -> Vec<RawEndpoint> {
     let literals = scan_literals(src);
     let consts = collect_consts(src, &literals);
     let mut combined = combine_literals(src, literals.clone(), &consts);
     combined.extend(const_joined_values(src, &literals, &consts));
     combined.extend(regex_pass(src));
+    // SWC real parsing: exact string and template literals, even in
+    // minified or nested code. On parse failure it returns nothing
+    // and the passes above still stand. Filter SWC fragments: a
+    // literal that is only a piece of an already-joined endpoint
+    // ("/api/" or "v2/orders" inside "/api/v2/orders") is not an
+    // endpoint on its own, and a trailing-slash literal alone is
+    // a base prefix, not a route.
+    let tokenizer_values = combined.clone();
+    for swc_value in crate::swc_extract::extract_swc(src) {
+        if swc_value.ends_with('/') {
+            continue;
+        }
+        if tokenizer_values.iter().any(|t| t != &swc_value && t.contains(&swc_value)) {
+            continue;
+        }
+        combined.push(swc_value);
+    }
 
     let mut out: Vec<RawEndpoint> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -336,7 +372,9 @@ pub fn extract_from_js(src: &str) -> Vec<RawEndpoint> {
         };
         // A literal may contain several space-separated URLs in minified
         // code; only keep it whole if it looks like one endpoint.
-        if looks_like_endpoint(&value) && seen.insert(value.clone()) {
+        // Dedup is on the normalised key, so {user} and {param}
+        // versions of the same template count as one endpoint.
+        if looks_like_endpoint(&value) && seen.insert(dedup_key(&value)) {
             let snippet = snippet_around(src, &value);
             out.push(RawEndpoint { value, snippet });
         }

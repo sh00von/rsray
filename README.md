@@ -19,6 +19,8 @@ cargo install --path .
 ```bash
 rsray --help   # full help with examples
 rsray -h       # short help
+rsray --h      # same as --help
+rsray -help    # same as --help
 rsray --version
 ```
 
@@ -33,29 +35,151 @@ Like sqlmap, progress and timing go to stderr, so stdout stays clean for piping:
 
 The final summary also prints `Finished in X.XXs`.
 
-## Usage
+## Quick start
 
 ```bash
-# One local bundle
+# 1. Install
+cargo install rsray
+
+# 2. Scan one file
 rsray app.js
 
-# One remote bundle, JSON output
+# 3. Scan a whole site and save the results
+rsray https://example.com --json -o endpoints.json
+```
+
+## Examples by input type
+
+```bash
+# 1. One local JS file
+rsray app.js
+rsray ./dist/main.js --json -o endpoints.json
+
+# 2. A whole directory (scans .js/.mjs/.cjs/.ts/.tsx/.jsx/.py/.go/
+#    .php/.rb/.java/.json/.html files inside it)
+rsray ./bundles/
+rsray ./src --json -o endpoints.json
+
+# 3. One remote JS URL
+rsray https://example.com/app.js
 rsray https://example.com/app.js --json -o endpoints.json
 
-# A whole website: crawl up to 20 internal pages, sitemap, robots.txt,
-# source maps and chunk references, then extract
-rsray https://example.com --wordlist words.txt -o endpoints.txt
+# 4. A whole website: crawls internal pages, sitemap.xml,
+#    robots.txt, source maps and chunk references, then extracts
+rsray https://example.com
+rsray https://example.com --json -o endpoints.json
 
-# Hunter output: full URLs only, or flagged endpoints only
+# 5. Many inputs from stdin, one per line (files, URLs, or sites)
+cat js_urls.txt | rsray --stdin
+cat js_urls.txt | rsray --stdin --json -o endpoints.json
+
+# 6. The same stdin list, using "-" as the input
+cat js_urls.txt | rsray -
+echo "https://example.com/app.js" | rsray --stdin
+```
+
+## Examples by output type
+
+```bash
+# Grouped terminal output (default): API / Page / External /
+# WebSocket / Static, with flags like [admin,versioned]
+rsray https://example.com
+
+# JSON output, to a file or to stdout
+rsray https://example.com/app.js --json -o endpoints.json
+rsray app.js --json
+
+# CSV output (endpoint,source_file,class,flags,method)
+rsray https://example.com --csv -o endpoints.csv
+
+# Endpoints only, one per line, no summary — for piping
+rsray ./bundles/ -q
+rsray https://example.com -q | httpx -silent
+
+# Full URLs only, one per line — ready for httpx / ffuf
 rsray https://example.com --urls -o urls.txt
+rsray https://example.com --urls | httpx -silent
+
+# Only flagged endpoints (admin, internal, debug, staging,
+# test, beta, backup, old, versioned, parameterised)
+rsray https://example.com --interesting-only
+rsray https://example.com --interesting-only --json -o interesting.json
+
+# Show source file and code snippet for every endpoint
+rsray app.js -v
+rsray https://example.com -v --json -o endpoints.json
+
+# Also write a wordlist (path segments) from the endpoints found
+rsray https://example.com --wordlist words.txt
+rsray https://example.com --wordlist words.txt --urls -o urls.txt
+```
+
+## Examples by filtering
+
+```bash
+# Only endpoints for one domain
+rsray https://example.com --scope example.com
+rsray ./bundles/ --scope example.com -q
+
+# Also include static assets (images, CSS, fonts) — off by default
+rsray https://example.com --include-static
+
+# Also include endpoints on external domains — off by default,
+# site mode only
+rsray https://example.com --include-external
+
+# Also report high-confidence secret patterns (off by default;
+# printed to stderr, review manually, do not trust blindly)
+rsray https://example.com --secrets
+```
+
+## Examples by crawl tuning
+
+```bash
+# Homepage only, no page crawling
+rsray https://example.com --max-pages 0
+
+# Crawl up to 50 internal pages instead of the default 20
+rsray https://example.com --max-pages 50
+
+# Follow chunk references only 1 level deep (default 5)
+rsray https://example.com --depth 1
+
+# Fetch scripts 32 at a time instead of the default 16
+rsray https://example.com --concurrency 32
+
+# Slow / large site: fewer pages, fewer parallel fetches
+rsray https://example.com --max-pages 5 --concurrency 4
+
+# Disable colours even on a terminal (colours are already off
+# automatically in JSON, CSV, quiet and piped output)
+rsray https://example.com --no-color
+```
+
+## Hunter workflow, step by step
+
+```bash
+# Step 1: Crawl the target and save everything
+rsray https://example.com --json -o endpoints.json
+
+# Step 2: Look at the interesting routes first
 rsray https://example.com --interesting-only
 
-# Many JS URLs, one per line
-cat js_urls.txt | rsray --stdin
+# Step 3: Build a URL list and probe which ones are live
+rsray https://example.com --urls -o urls.txt
+httpx -l urls.txt -silent -status-code
 
-# Endpoints only, for piping into other tools
-rsray ./bundles/ --scope example.com -q | httpx -silent
+# Step 4: Build a wordlist for fuzzing from the paths found
+rsray https://example.com --wordlist words.txt
+ffuf -u https://example.com/FUZZ -w words.txt
+
+# Step 5: Check for secrets separately, and review every hit by hand
+rsray https://example.com --secrets
 ```
+
+Manually review every discovered endpoint before doing anything with it.
+rsray only reads public JavaScript — it does not exploit, brute-force,
+or bypass authentication.
 
 ## Options
 
@@ -82,7 +206,7 @@ rsray ./bundles/ --scope example.com -q | httpx -silent
 
 1. **Input** — a file, a directory, a JS URL, a website, or a list from stdin.
 2. **Fetch** — site mode crawls internal pages, sitemap.xml and robots.txt, fetches scripts in parallel, follows chunk references recursively, and fetches source maps.
-3. **Extract** — string literals are tokenised, literals joined by `+` are re-joined, `const API = "..."` base URLs are resolved, and `` `/api/users/${id}` `` becomes `/api/users/{id}`. A language-aware regex pass also catches endpoints in Python, Go, PHP, Ruby, Java and JSON code. Multi-byte text (for example Bangla) is handled without panics.
+3. **Extract** — string literals are tokenised, literals joined by `+` are re-joined, `const API = "..."` base URLs are resolved, and `` `/api/users/${id}` `` becomes `/api/users/{id}`. A real SWC parse is a second pass, so exact string and template literals are caught even in minified or nested code; if SWC cannot parse a fragment, the tokenizer pass still stands. A language-aware regex pass also catches endpoints in Python, Go, PHP, Ruby, Java and JSON code. Multi-byte text (for example Bangla) is handled without panics.
 4. **Classify** — API routes (`/api`, `/rest`, `/graphql`, `/v1`..), page routes, static assets, external hosts, and WebSockets, with flags for `admin`, `internal`, `debug`, `staging`, versioned APIs, and parameterised routes. Colours appear only on a real terminal, never in JSON, CSV or piped output.
 5. **Output** — grouped terminal output, JSON, CSV, or plain text, plus an optional wordlist.
 

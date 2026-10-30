@@ -10,6 +10,7 @@
 
 mod classifier;
 mod extractor;
+mod swc_extract;
 
 use classifier::{Class, Endpoint};
 use clap::Parser;
@@ -493,7 +494,13 @@ struct JsonEndpoint<'a> {
 }
 
 fn main() {
-    let args = Args::parse();
+    // Help aliases: `--h` and `-help` are not standard clap flags,
+    // but users type them, so treat both exactly like `--help`
+    // (full help) instead of erroring on `--h`.
+    let argv: Vec<String> = std::env::args()
+        .map(|a| if a == "--h" || a == "-help" { "--help".to_string() } else { a })
+        .collect();
+    let args = Args::parse_from(argv);
     let start = Instant::now();
     progress(&start, args.quiet, "rsray started");
 
