@@ -1,5 +1,7 @@
 # rsray
 
+[![Crates.io](https://img.shields.io/crates/v/rsray.svg)](https://crates.io/crates/rsray)
+
 Extract endpoints from JavaScript bundles and websites.
 
 Use only on systems you own or are authorized to test.
@@ -9,6 +11,8 @@ Use only on systems you own or are authorized to test.
 ```bash
 cargo install rsray
 ```
+
+Also on crates.io: https://crates.io/crates/rsray
 
 From source:
 
@@ -149,10 +153,16 @@ Directory mode scans `.js`, `.mjs`, `.cjs`, `.ts`, `.tsx`,
 
 ## Development
 
+Requires a stable Rust toolchain. No other setup is needed.
+
 ```bash
+git clone https://github.com/sh00von/rsray
+cd rsray
 cargo test
 cargo build --release
 ```
+
+Pull requests are welcome. Run `cargo test` before submitting one.
 
 ## License
 
